@@ -198,14 +198,19 @@ def ls(
 ) -> None:
     """List the device's folders and documents (read-only)."""
     cfg = _require_config()
+    password = None
+    if not cfg.uses_key:
+        password = getpass.getpass(f"Password for {cfg.target()}: ")
     try:
-        client = _connect(cfg)
+        with out.status(f"[dim]Connecting to {cfg.target()}…[/]", spinner="dots"):
+            client = ssh.connect(cfg, password=password)
     except ssh.SSHError as exc:
         err.print(f"[red]Could not connect to {cfg.host}:[/] {exc}")
         _connection_hint(cfg)
         raise typer.Exit(1)
     try:
-        items = read_device(client, cfg.xochitl_path)
+        with out.status("[dim]Reading device library…[/]", spinner="dots"):
+            items = read_device(client, cfg.xochitl_path)
     finally:
         client.close()
     _render_tree(items, include_trash=include_trash)

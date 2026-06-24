@@ -9,6 +9,7 @@ and surfaces a clear hint on failure rather than silently disabling anything.
 from __future__ import annotations
 
 import shlex
+import time
 from pathlib import Path
 
 import paramiko
@@ -57,13 +58,46 @@ def connect(
     return client
 
 
-def run(client: paramiko.SSHClient, command: str, *, timeout: float = 60.0) -> tuple[int, str, str]:
-    """Run a shell command; return (exit_code, stdout, stderr)."""
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    rc = stdout.channel.recv_exit_status()
-    out = stdout.read().decode("utf-8", "replace")
-    err = stderr.read().decode("utf-8", "replace")
-    return rc, out, err
+def run(client: paramiko.SSHClient, command: str, *, timeout: float = 120.0) -> tuple[int, str, str]:
+    """Run a shell command; return (exit_code, stdout, stderr).
+
+    Drains stdout *and* stderr as data arrives rather than waiting on the exit
+    status first. A large command output can fill the SSH channel window; if we
+    block on ``recv_exit_status`` without reading, the remote process blocks on
+    write, never exits, and we deadlock. ``timeout`` is a wall-clock ceiling.
+    """
+    transport = client.get_transport()
+    if transport is None:
+        raise SSHError("connection is not open")
+    chan = transport.open_session()
+    chan.settimeout(0.0)  # non-blocking recv; we poll readiness ourselves
+    chan.exec_command(command)
+
+    out, err = bytearray(), bytearray()
+    deadline = time.monotonic() + timeout
+    while True:
+        progressed = False
+        while chan.recv_ready():
+            out += chan.recv(65536)
+            progressed = True
+        while chan.recv_stderr_ready():
+            err += chan.recv_stderr(65536)
+            progressed = True
+        if chan.exit_status_ready():
+            while chan.recv_ready():
+                out += chan.recv(65536)
+            while chan.recv_stderr_ready():
+                err += chan.recv_stderr(65536)
+            break
+        if time.monotonic() > deadline:
+            chan.close()
+            raise SSHError(f"command timed out after {timeout:.0f}s")
+        if not progressed:
+            time.sleep(0.02)
+
+    rc = chan.recv_exit_status()
+    chan.close()
+    return rc, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
 def install_public_key(cfg: DeviceConfig, password: str, public_key_line: str) -> None:

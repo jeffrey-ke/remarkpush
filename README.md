@@ -7,8 +7,9 @@ It talks to the device over **SSH** (default), which avoids the reMarkable
 cloud's free-tier limits (50 documents, 50-day unsynced drop) and its Connect
 subscription entirely — your library is bounded only by the device's storage.
 
-> **Status: Phase 0** — connection + read-only listing. `push`/`pull` are
-> stubbed and land in the next phases (see Roadmap).
+> **Status: push + pull working** (Phases 0–2). `init`, `preflight`, `ls`,
+> `status`, `push`, and `pull` (incl. device-rendered `--annotated`) are all
+> functional. Phase 3 (cloud backend, bidirectional `sync`) is optional/future.
 
 ## Why SSH
 
@@ -39,9 +40,26 @@ uv run remarkpush --help
 # (asks for the root password once; never stores it).
 uv run remarkpush init
 
+# Check the device is ready (run after plugging in).
+uv run remarkpush preflight
+
 # List your device library (read-only).
 uv run remarkpush ls
+
+# Push a PDF/EPUB (or a whole folder) into a collection.
+uv run remarkpush push paper.pdf --to Research
+uv run remarkpush push ./papers --to Reading --dry-run   # preview first
+
+# See what's new/modified vs. the device.
+uv run remarkpush status
+
+# Pull originals back, or flattened annotated PDFs (device-rendered over USB).
+uv run remarkpush pull Research -o ./out
+uv run remarkpush pull Research -o ./out --annotated
 ```
+
+`--annotated` needs the USB web interface on (Settings → Storage) and the
+cable connected — it uses xochitl's own renderer for the highest fidelity.
 
 Find the root password on the device under **Settings → Help → Copyright and
 licenses**, beneath the *GPLv3 Compliance* header. Connect over USB
@@ -86,13 +104,21 @@ changes appear. Design rules this tool follows:
 
 ## Roadmap
 
-- **Phase 0 (done):** `init`, `ls` (read-only).
-- **Phase 1:** `push` files/folders, folder + tag creation, local sync index,
-  `status` / `--dry-run`, `.rmpushignore`.
-- **Phase 2:** `pull` originals; `pull --annotated` (client render via
-  `rmscene`/`remarks`, plus USB device-rendered PDF).
+- **Phase 0 (done):** `init`, `preflight`, `ls` (read-only).
+- **Phase 1 (done):** `push` files/folders, folder + tag creation, local sync
+  index, `status` / `--dry-run`, `.rmpushignore`.
+- **Phase 2 (done):** `pull` originals; `pull --annotated` via the USB
+  device-rendered PDF. (Wi-Fi client-side render with `rmscene`/`remarks` is a
+  future fallback.)
 - **Phase 3 (optional):** cloud (`rmapi`) backend, bidirectional `sync`,
   thumbnails.
+
+### Known caveats
+
+- **Tags** are written to the sidecar but not yet verified to render on-device.
+- **Annotated pull** currently requires the USB cable + web interface (no Wi-Fi
+  client-render fallback yet).
+- `push --force` re-uploads but doesn't yet remove the prior copy (can duplicate).
 
 ## Acknowledgements
 

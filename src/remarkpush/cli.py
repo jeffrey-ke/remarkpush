@@ -7,11 +7,18 @@ device tree). ``push``/``pull``/``status`` are stubbed until Phase 1/2.
 from __future__ import annotations
 
 import getpass
+import posixpath
+import shlex
+import socket
+import uuid as _uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import paramiko
 import typer
 from rich.console import Console
+from rich.progress import BarColumn, DownloadColumn, Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 from rich.tree import Tree as RichTree
 
 from . import __version__
@@ -25,7 +32,18 @@ from .config import (
     repo_dir,
     save_config,
 )
-from .device import Item, children_map, read_device
+from .device import (
+    Item,
+    children_map,
+    ensure_folder_path,
+    file_type_for,
+    find_child,
+    read_device,
+    restart_xochitl,
+    upload_document,
+)
+from .ignore import is_ignored, load_ignore
+from .index import Index, sha256_file
 from .transport import ssh
 
 app = typer.Typer(
@@ -216,23 +234,356 @@ def ls(
     _render_tree(items, include_trash=include_trash)
 
 
-def _not_yet(name: str, phase: str) -> None:
-    err.print(f"[yellow]`{name}` arrives in {phase} — not implemented yet.[/]")
-    raise typer.Exit(1)
+def _human(n: int) -> str:
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if f < 1024 or unit == "GB":
+            return f"{f:.0f} {unit}" if unit == "B" else f"{f:.1f} {unit}"
+        f /= 1024
+    return f"{f:.1f} GB"
 
 
-@app.command()
-def status() -> None:
-    """Show what would push/pull (Phase 1)."""
-    _not_yet("status", "Phase 1")
+# --------------------------------------------------------------------------- #
+# push
+# --------------------------------------------------------------------------- #
+@dataclass
+class _PushItem:
+    local: Path
+    folder_path: str  # device folder, "" = root
+    name: str
+    file_type: str | None
+    size: int
+    sha: str
+    action: str  # upload | uptodate | exists | unsupported
+    uuid: str = ""
+
+
+def _expand_paths(paths: list[str], to: str) -> list[tuple[Path, str]]:
+    pairs: list[tuple[Path, str]] = []
+    for raw in paths:
+        p = Path(raw).expanduser()
+        if not p.exists():
+            err.print(f"[red]Not found:[/] {raw}")
+            raise typer.Exit(1)
+        if p.is_file():
+            pairs.append((p, to))
+        else:
+            spec = load_ignore(p)
+            base = "/".join(x for x in (to, p.name) if x)
+            for f in sorted(p.rglob("*")):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(p)
+                if is_ignored(spec, str(rel)):
+                    continue
+                sub = "/".join(rel.parts[:-1])
+                folder = "/".join(x for x in (base, sub) if x)
+                pairs.append((f, folder))
+    return pairs
+
+
+def _resolve_folder_uuid(items: dict[str, Item], folder_path: str) -> str | None:
+    """Existing folder UUID for a slash path, or None if it isn't all there yet."""
+    if not folder_path:
+        return ""
+    parent = ""
+    for part in (p for p in folder_path.split("/") if p):
+        child = find_child(items, parent, part, folders_only=True)
+        if child is None:
+            return None
+        parent = child.uuid
+    return parent
+
+
+def _build_plan(
+    pairs: list[tuple[Path, str]],
+    items: dict[str, Item],
+    index: Index,
+    force: bool,
+) -> list[_PushItem]:
+    plan: list[_PushItem] = []
+    for local, folder in pairs:
+        ft = file_type_for(local)
+        size = local.stat().st_size
+        name = local.stem
+        if ft is None:
+            plan.append(_PushItem(local, folder, name, None, size, "", "unsupported"))
+            continue
+        sha = sha256_file(local)
+        entry = index.get(local)
+        if entry and entry.sha256 == sha and entry.uuid in items and not force:
+            plan.append(_PushItem(local, folder, name, ft, size, sha, "uptodate", entry.uuid))
+            continue
+        folder_uuid = _resolve_folder_uuid(items, folder)
+        existing = find_child(items, folder_uuid, name, folders_only=False) if folder_uuid is not None else None
+        if existing is not None and not force:
+            plan.append(_PushItem(local, folder, name, ft, size, sha, "exists", existing.uuid))
+            continue
+        plan.append(_PushItem(local, folder, name, ft, size, sha, "upload"))
+    return plan
+
+
+_ACTION_STYLE = {
+    "upload": ("[green]push[/]", None),
+    "uptodate": ("[dim]up-to-date[/]", "dim"),
+    "exists": ("[yellow]exists[/]", "yellow"),
+    "unsupported": ("[red]skip (type)[/]", "red"),
+}
+
+
+def _print_plan(plan: list[_PushItem]) -> None:
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("action")
+    table.add_column("document")
+    table.add_column("→ folder")
+    table.add_column("size", justify="right")
+    for p in plan:
+        label, style = _ACTION_STYLE[p.action]
+        dest = "/" + p.folder_path if p.folder_path else "/"
+        name = f"[{style}]{p.name}[/]" if style else p.name
+        table.add_row(label, name, f"[dim]{dest}[/]", _human(p.size))
+    out.print(table)
 
 
 @app.command()
 def push(
-    paths: list[str] = typer.Argument(None, help="Files or folders to push."),
+    paths: list[str] = typer.Argument(..., help="Files or folders to push."),
+    to: str = typer.Option("", "--to", help="Destination folder (slash path, created if missing)."),
+    tag: list[str] = typer.Option([], "--tag", help="Tag(s) to apply (best-effort)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the plan; write nothing."),
+    force: bool = typer.Option(False, "--force", help="Upload even if a same-named doc exists."),
+    no_restart: bool = typer.Option(False, "--no-restart", help="Don't restart xochitl afterward."),
 ) -> None:
-    """Push files/folders to the device (Phase 1)."""
-    _not_yet("push", "Phase 1")
+    """Push PDFs/EPUBs (files or folders) to the device."""
+    cfg = _require_config()
+    pairs = _expand_paths(paths, to.strip("/"))
+    if not pairs:
+        out.print("[dim]Nothing to push.[/]")
+        raise typer.Exit(0)
+
+    password = None
+    if not cfg.uses_key:
+        password = getpass.getpass(f"Password for {cfg.target()}: ")
+    try:
+        with out.status(f"[dim]Connecting to {cfg.target()}…[/]", spinner="dots"):
+            client = ssh.connect(cfg, password=password)
+    except ssh.SSHError as exc:
+        err.print(f"[red]Could not connect:[/] {exc}")
+        _connection_hint(cfg)
+        raise typer.Exit(1)
+
+    try:
+        with out.status("[dim]Reading device library…[/]", spinner="dots"):
+            items = read_device(client, cfg.xochitl_path)
+        index = Index.load()
+        plan = _build_plan(pairs, items, index, force)
+        _print_plan(plan)
+
+        uploads = [p for p in plan if p.action == "upload"]
+        if dry_run:
+            out.print(f"\n[dim]Dry run — {len(uploads)} would upload, nothing written.[/]")
+            raise typer.Exit(0)
+        if not uploads:
+            out.print("\n[dim]Nothing to upload.[/]")
+            raise typer.Exit(0)
+
+        sftp = client.open_sftp()
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                DownloadColumn(),
+                console=out,
+            ) as prog:
+                for p in uploads:
+                    folder_uuid = (
+                        ensure_folder_path(sftp, cfg.xochitl_path, items, p.folder_path)
+                        if p.folder_path
+                        else ""
+                    )
+                    task = prog.add_task(p.name[:38], total=p.size)
+
+                    def _cb(done: int, total: int, _t=task, _sz=p.size) -> None:
+                        prog.update(_t, completed=done, total=total or _sz)
+
+                    new_uuid = upload_document(
+                        sftp,
+                        cfg.xochitl_path,
+                        p.local,
+                        parent_uuid=folder_uuid,
+                        visible_name=p.name,
+                        file_type=p.file_type or "pdf",
+                        tags=list(tag),
+                        progress=_cb,
+                    )
+                    prog.update(task, completed=p.size)
+                    index.record(
+                        p.local,
+                        sha256=p.sha,
+                        uuid=new_uuid,
+                        visible_name=p.name,
+                        parent_uuid=folder_uuid,
+                        size=p.size,
+                    )
+        finally:
+            sftp.close()
+
+        index.save()
+        if not no_restart:
+            with out.status("[dim]Restarting xochitl…[/]", spinner="dots"):
+                restart_xochitl(client)
+    finally:
+        client.close()
+
+    out.print(f"\n[green]✓ Pushed {len(uploads)} document(s).[/]")
+    if no_restart:
+        out.print("[dim]Skipped xochitl restart — files appear after the next restart/reboot.[/]")
+
+
+# --------------------------------------------------------------------------- #
+# preflight
+# --------------------------------------------------------------------------- #
+def _tcp_open(host: str, port: int, timeout: float = 4.0) -> tuple[bool, str]:
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+        return True, "open"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _write_test(client: paramiko.SSHClient, xochitl_path: str) -> tuple[bool, str]:
+    sftp = client.open_sftp()
+    name = posixpath.join(xochitl_path, f".remarkpush-preflight-{_uuid.uuid4().hex}.tmp")
+    try:
+        with sftp.open(name, "w") as h:
+            h.write(b"ok")
+        sftp.remove(name)
+        return True, "writable"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        sftp.close()
+
+
+def _free_space(client: paramiko.SSHClient, path: str) -> str | None:
+    _rc, dfout, _e = ssh.run(client, f"df -k {shlex.quote(path)} | tail -1")
+    parts = dfout.split()
+    if len(parts) >= 4 and parts[3].isdigit():
+        return f"{int(parts[3]) / 1024 / 1024:.2f} GiB free"
+    return None
+
+
+@app.command()
+def preflight() -> None:
+    """Check the device is ready for push/pull (run after plugging in)."""
+    cfg = _require_config()
+    rows: list[tuple[str, bool, str]] = [("config", True, str(CONFIG_PATH))]
+
+    ok, detail = _tcp_open(cfg.host, 22)
+    rows.append((f"reach {cfg.host}:22", ok, detail))
+    if not ok:
+        _render_checks(rows)
+        _connection_hint(cfg)
+        raise typer.Exit(1)
+
+    password = None
+    if not cfg.uses_key:
+        password = getpass.getpass(f"Password for {cfg.target()}: ")
+    try:
+        client = ssh.connect(cfg, password=password)
+    except ssh.SSHError as exc:
+        rows.append(("ssh auth", False, str(exc)))
+        _render_checks(rows)
+        _connection_hint(cfg)
+        raise typer.Exit(1)
+    rows.append(("ssh auth", True, cfg.target() + (" · key" if cfg.uses_key else " · password")))
+
+    try:
+        _rc, dirout, _e = ssh.run(client, f"test -d {shlex.quote(cfg.xochitl_path)} && echo ok")
+        rows.append(("xochitl store", dirout.strip() == "ok", cfg.xochitl_path))
+
+        wok, wdetail = _write_test(client, cfg.xochitl_path)
+        rows.append(("write access (push)", wok, wdetail))
+
+        free = _free_space(client, cfg.xochitl_path)
+        rows.append(("free space", free is not None, free or "unknown"))
+
+        _rc, active, _e = ssh.run(client, "systemctl is-active xochitl.service")
+        rows.append(("xochitl service", active.strip() == "active", active.strip() or "unknown"))
+
+        items = read_device(client, cfg.xochitl_path)
+        ndoc = sum(1 for i in items.values() if i.is_document and not i.deleted)
+        rows.append(("library read (pull)", True, f"{ndoc} documents"))
+    finally:
+        client.close()
+
+    _render_checks(rows)
+    ready = all(ok for _n, ok, _d in rows)
+    out.print(
+        "\n[green]✓ Ready to push and pull.[/]" if ready else "\n[red]✗ Not ready — see failures above.[/]"
+    )
+    raise typer.Exit(0 if ready else 1)
+
+
+def _render_checks(rows: list[tuple[str, bool, str]]) -> None:
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("")
+    table.add_column("check")
+    table.add_column("detail")
+    for name, ok, detail in rows:
+        mark = "[green]✓[/]" if ok else "[red]✗[/]"
+        table.add_row(mark, name, f"[dim]{detail}[/]")
+    out.print(table)
+
+
+# --------------------------------------------------------------------------- #
+# status
+# --------------------------------------------------------------------------- #
+@app.command()
+def status() -> None:
+    """Show push state of PDFs/EPUBs under the current directory."""
+    cfg = _require_config()
+    root = Path.cwd()
+    spec = load_ignore(root)
+    files = [
+        f
+        for f in sorted(root.rglob("*"))
+        if f.is_file() and file_type_for(f) and not is_ignored(spec, str(f.relative_to(root)))
+    ]
+    if not files:
+        out.print("[dim]No PDFs/EPUBs under the current directory.[/]")
+        raise typer.Exit(0)
+
+    index = Index.load(root)
+    password = None
+    if not cfg.uses_key:
+        password = getpass.getpass(f"Password for {cfg.target()}: ")
+    try:
+        with out.status("[dim]Reading device library…[/]", spinner="dots"):
+            client = ssh.connect(cfg, password=password)
+            items = read_device(client, cfg.xochitl_path)
+            client.close()
+    except ssh.SSHError as exc:
+        err.print(f"[red]Could not connect:[/] {exc}")
+        raise typer.Exit(1)
+
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("state")
+    table.add_column("file")
+    for f in files:
+        rel = f.relative_to(root)
+        entry = index.get(f)
+        if entry is None:
+            state = "[green]new[/]"
+        elif entry.uuid not in items:
+            state = "[yellow]gone on device[/]"
+        elif sha256_file(f) != entry.sha256:
+            state = "[cyan]modified[/]"
+        else:
+            state = "[dim]up-to-date[/]"
+        table.add_row(state, str(rel))
+    out.print(table)
 
 
 @app.command()
@@ -241,4 +592,5 @@ def pull(
     annotated: bool = typer.Option(False, "--annotated", help="Flatten annotations into the PDF."),
 ) -> None:
     """Pull documents back from the device (Phase 2)."""
-    _not_yet("pull", "Phase 2")
+    err.print("[yellow]`pull` arrives in Phase 2 — not implemented yet.[/]")
+    raise typer.Exit(1)

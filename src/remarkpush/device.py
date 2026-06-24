@@ -221,6 +221,46 @@ def upload_document(
     return doc_uuid
 
 
+def sanitize_name(name: str) -> str:
+    """Make a visibleName safe as a local filename. The device allows '/' in
+    names (e.g. '1/21'); map it to U+2215 DIVISION SLASH so it reads the same
+    without creating phantom directories."""
+    cleaned = name.replace("/", "∕").strip()
+    return cleaned or "untitled"
+
+
+def folder_path_of(items: dict[str, Item], item: Item) -> str:
+    """Slash-joined sanitized folder path of an item's parents (no filename)."""
+    parts: list[str] = []
+    seen: set[str] = set()
+    cur = items.get(item.parent)
+    while cur is not None and cur.uuid not in seen:
+        seen.add(cur.uuid)
+        parts.append(sanitize_name(cur.visible_name))
+        cur = items.get(cur.parent)
+    return "/".join(reversed(parts))
+
+
+def documents_under(items: dict[str, Item], root_uuid: str) -> list[Item]:
+    """All DocumentType items at or below ``root_uuid`` (\"\" = whole library)."""
+    kids = children_map(items, include_trash=False)
+    docs: list[Item] = []
+    stack = [root_uuid]
+    while stack:
+        parent = stack.pop()
+        for item in kids.get(parent, []):
+            if item.is_folder:
+                stack.append(item.uuid)
+            elif item.is_document:
+                docs.append(item)
+    return docs
+
+
+def download_original(sftp: _paramiko.SFTPClient, xochitl_path: str, item: Item, dest, *, callback=None) -> None:
+    remote = posixpath.join(xochitl_path, f"{item.uuid}.{item.file_type}")
+    sftp.get(remote, str(dest), callback=callback)
+
+
 def restart_xochitl(client: paramiko.SSHClient) -> None:
     """Restart xochitl once so writes appear, guarding the systemd start-limit.
 

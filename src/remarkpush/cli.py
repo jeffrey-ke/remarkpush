@@ -35,16 +35,20 @@ from .config import (
 from .device import (
     Item,
     children_map,
+    documents_under,
+    download_original,
     ensure_folder_path,
     file_type_for,
     find_child,
+    folder_path_of,
     read_device,
     restart_xochitl,
+    sanitize_name,
     upload_document,
 )
 from .ignore import is_ignored, load_ignore
 from .index import Index, sha256_file
-from .transport import ssh
+from .transport import ssh, usb
 
 app = typer.Typer(
     add_completion=False,
@@ -586,11 +590,126 @@ def status() -> None:
     out.print(table)
 
 
+@dataclass
+class _PullItem:
+    item: Item
+    folder: str  # local relative folder path
+    dest: Path
+    kind: str  # "original" | "annotated" | "skip-notebook"
+
+
+def _build_pull_plan(
+    items: dict[str, Item], targets: list[Item], out_dir: Path, annotated: bool
+) -> list[_PullItem]:
+    plan: list[_PullItem] = []
+    for doc in targets:
+        folder = folder_path_of(items, doc)
+        name = sanitize_name(doc.visible_name)
+        local_folder = out_dir / Path(folder) if folder else out_dir
+        if annotated:
+            plan.append(_PullItem(doc, folder, local_folder / f"{name}.pdf", "annotated"))
+        elif doc.file_type in ("pdf", "epub"):
+            plan.append(_PullItem(doc, folder, local_folder / f"{name}.{doc.file_type}", "original"))
+        else:
+            plan.append(_PullItem(doc, folder, local_folder / f"{name}.pdf", "skip-notebook"))
+    return plan
+
+
 @app.command()
 def pull(
-    remote: str = typer.Argument(None, help="Remote folder to pull."),
-    annotated: bool = typer.Option(False, "--annotated", help="Flatten annotations into the PDF."),
+    remote: str = typer.Argument("", help="Remote folder to pull (default: whole library)."),
+    out_dir: Path = typer.Option(Path("."), "-o", "--out", help="Local output directory."),
+    annotated: bool = typer.Option(
+        False, "--annotated", help="Flatten annotations into a PDF (device-rendered over USB)."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the plan; download nothing."),
 ) -> None:
-    """Pull documents back from the device (Phase 2)."""
-    err.print("[yellow]`pull` arrives in Phase 2 — not implemented yet.[/]")
-    raise typer.Exit(1)
+    """Pull documents (originals, or flattened annotated PDFs) from the device."""
+    cfg = _require_config()
+    password = None
+    if not cfg.uses_key:
+        password = getpass.getpass(f"Password for {cfg.target()}: ")
+    try:
+        with out.status(f"[dim]Connecting to {cfg.target()}…[/]", spinner="dots"):
+            client = ssh.connect(cfg, password=password)
+            items = read_device(client, cfg.xochitl_path)
+    except ssh.SSHError as exc:
+        err.print(f"[red]Could not connect:[/] {exc}")
+        _connection_hint(cfg)
+        raise typer.Exit(1)
+
+    folder_uuid = _resolve_folder_uuid(items, remote.strip("/"))
+    if folder_uuid is None:
+        client.close()
+        err.print(f"[red]No such device folder:[/] {remote}")
+        raise typer.Exit(1)
+
+    targets = documents_under(items, folder_uuid)
+    plan = _build_pull_plan(items, targets, out_dir, annotated)
+
+    downloads = [p for p in plan if p.kind in ("original", "annotated")]
+    skipped = [p for p in plan if p.kind == "skip-notebook"]
+
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("kind")
+    table.add_column("→ local path")
+    for p in plan:
+        if p.kind == "skip-notebook":
+            table.add_row("[yellow]skip (notebook)[/]", f"[dim]{p.dest}[/]")
+        else:
+            table.add_row(f"[green]{p.kind}[/]", str(p.dest))
+    out.print(table)
+
+    if dry_run:
+        client.close()
+        out.print(f"\n[dim]Dry run — {len(downloads)} would download, nothing written.[/]")
+        raise typer.Exit(0)
+    if not downloads:
+        client.close()
+        out.print("\n[dim]Nothing to download.[/]")
+        raise typer.Exit(0)
+
+    web_host = cfg.host
+    if annotated and not usb.web_interface_up(web_host):
+        client.close()
+        err.print(
+            f"[red]Annotated pull needs the device renderer, but the USB web interface "
+            f"isn't reachable at {web_host}:80.[/]"
+        )
+        err.print("[dim]Enable it on the tablet: Settings → Storage → USB web interface, "
+                  "then make sure you're connected over the USB cable.[/]")
+        raise typer.Exit(1)
+
+    n_ok = 0
+    try:
+        sftp = client.open_sftp() if not annotated else None
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+                console=out,
+            ) as prog:
+                task = prog.add_task("pulling", total=len(downloads))
+                for p in downloads:
+                    prog.update(task, description=p.item.visible_name[:38])
+                    p.dest.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        if annotated:
+                            usb.download_rendered_pdf(p.item.uuid, p.dest, host=web_host)
+                        else:
+                            download_original(sftp, cfg.xochitl_path, p.item, p.dest)
+                        n_ok += 1
+                    except Exception as exc:  # noqa: BLE001
+                        err.print(f"[red]Failed:[/] {p.item.visible_name} — {exc}")
+                    prog.advance(task)
+        finally:
+            if sftp is not None:
+                sftp.close()
+    finally:
+        client.close()
+
+    out.print(f"\n[green]✓ Pulled {n_ok}/{len(downloads)} document(s) to {out_dir}/[/]")
+    if skipped:
+        out.print(f"[dim]Skipped {len(skipped)} notebook(s) (no original; use --annotated to render them).[/]")

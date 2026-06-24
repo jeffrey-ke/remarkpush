@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+
+# remarkpush per-repo sync state
+.remarkpush/
+
+# macOS
+.DS_Store

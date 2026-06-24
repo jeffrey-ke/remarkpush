@@ -1,0 +1,34 @@
+[project]
+name = "remarkpush"
+version = "0.0.1"
+description = "git/huggingface-style CLI to push and pull PDFs & EPUBs to/from a reMarkable 2 over SSH"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+    "paramiko>=3.4",
+    "pathspec>=0.12",
+    "tomli-w>=1.0",
+]
+
+[project.optional-dependencies]
+# Annotation rendering for `pull --annotated` (Phase 2). Heavy-ish, kept optional.
+annotate = [
+    "rmscene>=0.5",
+    "rmc>=0.3",
+]
+
+[project.scripts]
+remarkpush = "remarkpush.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/remarkpush"]
+
+[dependency-groups]
+dev = ["pytest>=8"]

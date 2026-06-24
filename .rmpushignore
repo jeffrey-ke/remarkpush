@@ -1,0 +1,9 @@
+# gitignore-style patterns for files remarkpush should never push.
+# (Consumed in Phase 1; harmless to keep now.)
+
+.DS_Store
+*.tmp
+*.part
+drafts/
+.git/
+.remarkpush/

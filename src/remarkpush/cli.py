@@ -33,6 +33,7 @@ from .config import (
     save_config,
 )
 from .device import (
+    TRASH_PARENT,
     Item,
     children_map,
     documents_under,
@@ -40,7 +41,9 @@ from .device import (
     ensure_folder_path,
     file_type_for,
     find_child,
+    find_document_by_name,
     folder_path_of,
+    move_document,
     read_device,
     restart_xochitl,
     sanitize_name,
@@ -48,6 +51,7 @@ from .device import (
 )
 from .ignore import is_ignored, load_ignore
 from .index import Index, sha256_file
+from .reading_list import build_papers_index, parse_checklist, resolve_wikilink
 from .transport import ssh, usb
 
 app = typer.Typer(
@@ -443,6 +447,277 @@ def push(
     out.print(f"\n[green]✓ Pushed {len(uploads)} document(s).[/]")
     if no_restart:
         out.print("[dim]Skipped xochitl restart — files appear after the next restart/reboot.[/]")
+
+
+# --------------------------------------------------------------------------- #
+# reading-list
+# --------------------------------------------------------------------------- #
+_DEFAULT_READING_INDEX = Path("/Users/jke/repo/Research/Research/papers-remarkable.md")
+
+
+@dataclass
+class _ReadingItem:
+    link_name: str
+    checked: bool
+    local: Path | None       # resolved source PDF, None when the link didn't match
+    name: str                # device visible_name == local.stem ("" if unresolved)
+    target_uuid: str         # destination folder uuid for this entry
+    target_label: str        # destination folder name (for display)
+    action: str              # push | move | noop | unresolved
+    uuid: str = ""           # device doc uuid (for move/noop)
+    size: int = 0
+
+
+def _build_reading_plan(
+    entries,
+    papers_index: dict[str, Path],
+    items: dict[str, Item],
+    *,
+    to_read_uuid: str,
+    read_uuid: str,
+    to_read_label: str,
+    read_label: str,
+) -> list[_ReadingItem]:
+    """Per-entry action via a *library-wide* name lookup (so a copy already on the
+    device is moved, never duplicated). `checked` picks the target folder."""
+    plan: list[_ReadingItem] = []
+    seen: set[str] = set()
+    for e in entries:
+        local = resolve_wikilink(e.link_name, papers_index)
+        if local is None or file_type_for(local) is None:
+            plan.append(_ReadingItem(e.link_name, e.checked, None, "", "", "", "unresolved"))
+            continue
+        name = local.stem
+        key = name.casefold()
+        if key in seen:  # same paper listed twice in the md — first occurrence wins
+            continue
+        seen.add(key)
+
+        target_uuid = read_uuid if e.checked else to_read_uuid
+        target_label = read_label if e.checked else to_read_label
+        matches = find_document_by_name(items, name)
+        if not matches:
+            action, uuid = "push", ""
+        elif any(m.parent == target_uuid for m in matches):
+            action = "noop"
+            uuid = next(m.uuid for m in matches if m.parent == target_uuid)
+        else:
+            # Prefer relocating a copy that's in the *other* managed folder; else any copy.
+            other = next((m for m in matches if m.parent in (to_read_uuid, read_uuid)), matches[0])
+            action, uuid = "move", other.uuid
+
+        plan.append(
+            _ReadingItem(
+                e.link_name, e.checked, local, name,
+                target_uuid, target_label, action, uuid, local.stat().st_size,
+            )
+        )
+    return plan
+
+
+def _stale_documents(items: dict[str, Item], managed_uuids: set[str], wanted_names: set[str]) -> list[Item]:
+    """Live documents sitting in the managed folders whose name isn't in the md
+    (``wanted_names`` are casefolded). These are the prune/stale candidates."""
+    return [
+        it
+        for it in items.values()
+        if it.is_document
+        and not it.deleted
+        and it.parent in managed_uuids
+        and it.visible_name.casefold() not in wanted_names
+    ]
+
+
+_READING_STYLE = {
+    "push": ("[green]push[/]", None),
+    "move": ("[cyan]move[/]", "cyan"),
+    "noop": ("[dim]in place[/]", "dim"),
+    "unresolved": ("[red]unresolved[/]", "red"),
+}
+
+
+def _print_reading_plan(plan: list[_ReadingItem], stale: list[Item], prune: bool) -> None:
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("action")
+    table.add_column("document")
+    table.add_column("→ folder")
+    table.add_column("size", justify="right")
+    for p in plan:
+        label, style = _READING_STYLE[p.action]
+        if p.action == "unresolved":
+            table.add_row(label, f"[red]{p.link_name}[/]", "[dim]— no matching PDF[/]", "")
+        else:
+            doc = f"[{style}]{p.name}[/]" if style else p.name
+            table.add_row(label, doc, f"[dim]/{p.target_label}[/]", _human(p.size))
+    for it in stale:
+        if prune:
+            table.add_row("[magenta]prune[/]", f"[dim]{it.visible_name}[/]", "[dim]→ trash[/]", "")
+        else:
+            table.add_row("[yellow]stale[/]", f"[dim]{it.visible_name}[/]", "[dim](not in list)[/]", "")
+    out.print(table)
+
+
+@app.command(name="reading-list")
+def reading_list(
+    md_file: Path = typer.Argument(
+        _DEFAULT_READING_INDEX, help="Obsidian checklist markdown file (the reading-list index)."
+    ),
+    papers_dir: Path = typer.Option(
+        None, "--papers-dir", help="Folder of source PDFs (default: 'papers and figures' beside the md file)."
+    ),
+    to_read_folder: str = typer.Option("papers to read", "--to-read-folder", help="Device folder for unread papers."),
+    read_folder: str = typer.Option("papers read", "--read-folder", help="Device folder for read papers."),
+    prune: bool = typer.Option(
+        False, "--prune", help="Move papers in the managed folders that are no longer in the md to the device trash."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the plan; write nothing."),
+    no_restart: bool = typer.Option(False, "--no-restart", help="Don't restart xochitl afterward."),
+) -> None:
+    """Sync an Obsidian reading-list checklist to the reMarkable.
+
+    Unread (unchecked) papers go to the 'papers to read' folder; read (checked)
+    papers go to 'papers read'. A paper already on the device is moved into the
+    right folder, never re-uploaded — so unchecking a paper moves it back
+    instead of creating a duplicate. With --prune, papers in those two folders
+    that are no longer in the markdown file are moved to the device trash
+    (reversible)."""
+    cfg = _require_config()
+
+    md_file = md_file.expanduser()
+    if not md_file.is_file():
+        err.print(f"[red]Reading-list file not found:[/] {md_file}")
+        raise typer.Exit(1)
+    papers_dir = (papers_dir or md_file.parent / "papers and figures").expanduser()
+    if not papers_dir.is_dir():
+        err.print(f"[red]Papers directory not found:[/] {papers_dir}")
+        raise typer.Exit(1)
+
+    entries = parse_checklist(md_file.read_text(encoding="utf-8"))
+    if not entries:
+        out.print("[dim]No checklist entries found in the markdown file.[/]")
+        raise typer.Exit(0)
+    papers_index = build_papers_index(papers_dir)
+
+    password = None
+    if not cfg.uses_key:
+        password = getpass.getpass(f"Password for {cfg.target()}: ")
+    try:
+        with out.status(f"[dim]Connecting to {cfg.target()}…[/]", spinner="dots"):
+            client = ssh.connect(cfg, password=password)
+    except ssh.SSHError as exc:
+        err.print(f"[red]Could not connect:[/] {exc}")
+        _connection_hint(cfg)
+        raise typer.Exit(1)
+
+    try:
+        with out.status("[dim]Reading device library…[/]", spinner="dots"):
+            items = read_device(client, cfg.xochitl_path)
+
+        sftp = client.open_sftp()
+        try:
+            # The two managed folders must exist before planning so noop/move
+            # targeting is correct (ensure_folder_path mutates `items`). On a dry
+            # run we only *resolve* them — never create — so nothing is written;
+            # a not-yet-created folder gets a sentinel uuid no document can match.
+            if dry_run:
+                tr = _resolve_folder_uuid(items, to_read_folder)
+                rd = _resolve_folder_uuid(items, read_folder)
+                to_read_uuid = tr if tr is not None else "\x00to-read"
+                read_uuid = rd if rd is not None else "\x00read"
+            else:
+                to_read_uuid = ensure_folder_path(sftp, cfg.xochitl_path, items, to_read_folder)
+                read_uuid = ensure_folder_path(sftp, cfg.xochitl_path, items, read_folder)
+
+            index = Index.load()
+            plan = _build_reading_plan(
+                entries, papers_index, items,
+                to_read_uuid=to_read_uuid, read_uuid=read_uuid,
+                to_read_label=to_read_folder, read_label=read_folder,
+            )
+
+            wanted = {p.name.casefold() for p in plan if p.action != "unresolved"}
+            stale = _stale_documents(items, {to_read_uuid, read_uuid}, wanted)
+            _print_reading_plan(plan, stale, prune)
+
+            moves = [p for p in plan if p.action == "move"]
+            uploads = [p for p in plan if p.action == "push"]
+            unresolved = [p for p in plan if p.action == "unresolved"]
+            prunes = stale if prune else []
+
+            if unresolved:
+                out.print(f"\n[yellow]⚠ {len(unresolved)} wikilink(s) matched no PDF in {papers_dir.name}/[/]")
+
+            if dry_run:
+                out.print(
+                    f"\n[dim]Dry run — {len(uploads)} upload, {len(moves)} move, "
+                    f"{len(prunes)} prune; nothing written.[/]"
+                )
+                raise typer.Exit(0)
+            if not (moves or uploads or prunes):
+                out.print("\n[dim]Already in sync.[/]")
+                raise typer.Exit(0)
+
+            # 1) moves — re-parent in place, keep the local index consistent.
+            for p in moves:
+                try:
+                    move_document(sftp, cfg.xochitl_path, items[p.uuid], p.target_uuid)
+                except Exception as exc:  # noqa: BLE001
+                    err.print(f"[red]Move failed:[/] {p.name} — {exc}")
+                    continue
+                entry = index.get(p.local)
+                if entry is not None:
+                    index.record(
+                        p.local, sha256=entry.sha256, uuid=entry.uuid,
+                        visible_name=p.name, parent_uuid=p.target_uuid, size=entry.size,
+                    )
+
+            # 2) uploads — only papers not already anywhere on the device.
+            if uploads:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    DownloadColumn(),
+                    console=out,
+                ) as prog:
+                    for p in uploads:
+                        task = prog.add_task(p.name[:38], total=p.size)
+
+                        def _cb(done: int, total: int, _t=task, _sz=p.size) -> None:
+                            prog.update(_t, completed=done, total=total or _sz)
+
+                        new_uuid = upload_document(
+                            sftp, cfg.xochitl_path, p.local,
+                            parent_uuid=p.target_uuid, visible_name=p.name,
+                            file_type=file_type_for(p.local) or "pdf", progress=_cb,
+                        )
+                        prog.update(task, completed=p.size)
+                        index.record(
+                            p.local, sha256=sha256_file(p.local), uuid=new_uuid,
+                            visible_name=p.name, parent_uuid=p.target_uuid, size=p.size,
+                        )
+
+            # 3) prunes — trash papers dropped from the md (reversible).
+            for it in prunes:
+                try:
+                    move_document(sftp, cfg.xochitl_path, it, TRASH_PARENT)
+                except Exception as exc:  # noqa: BLE001
+                    err.print(f"[red]Prune failed:[/] {it.visible_name} — {exc}")
+        finally:
+            sftp.close()
+
+        index.save()
+        if not no_restart:
+            with out.status("[dim]Restarting xochitl…[/]", spinner="dots"):
+                restart_xochitl(client)
+    finally:
+        client.close()
+
+    summary = f"\n[green]✓ {len(uploads)} uploaded, {len(moves)} moved"
+    summary += f", {len(prunes)} trashed.[/]" if prune else ".[/]"
+    out.print(summary)
+    if no_restart:
+        out.print("[dim]Skipped xochitl restart — changes appear after the next restart/reboot.[/]")
 
 
 # --------------------------------------------------------------------------- #

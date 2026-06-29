@@ -15,21 +15,24 @@ uv run remarkpush init        # configure device, install SSH key, verify
 uv run remarkpush preflight   # check device is ready (after plugging in)
 uv run remarkpush push paper.pdf --to Reading
 uv run remarkpush pull Reading -o ./out --annotated
+uv run remarkpush reading-list notes.md --dry-run   # sync an Obsidian checklist
 ```
 
 ## Module index
 
 | Module | Role | Key exports |
 |---|---|---|
-| `src/remarkpush/cli.py` | Typer CLI; all commands + plan/progress/render helpers | `app`, `init`, `preflight`, `ls`, `push`, `status`, `pull` |
+| `src/remarkpush/cli.py` | Typer CLI; all commands + plan/progress/render helpers | `app`, `init`, `preflight`, `ls`, `push`, `status`, `pull`, `reading_list` |
 | `src/remarkpush/config.py` | Per-machine device config (`~/.config/remarkpush/config.toml`) + repo paths | `DeviceConfig`, `load_config`, `save_config`, `repo_dir` |
-| `src/remarkpush/device.py` | xochitl store model (read tree) + writer (push) + pull helpers | `Item`, `read_device`, `parse_dump`, `build_items`, `children_map`, `ensure_folder_path`, `upload_document`, `restart_xochitl`, `documents_under`, `download_original`, `folder_path_of`, `sanitize_name`, `file_type_for` |
-| `src/remarkpush/metadata.py` | Sidecar JSON builders for a *fresh* import (current OS format) | `document_metadata`, `folder_metadata`, `document_content`, `folder_content` |
+| `src/remarkpush/device.py` | xochitl store model (read tree) + writer (push/move) + pull helpers | `Item`, `read_device`, `parse_dump`, `build_items`, `children_map`, `ensure_folder_path`, `upload_document`, `move_document`, `restart_xochitl`, `documents_under`, `download_original`, `folder_path_of`, `find_child`, `find_document_by_name`, `sanitize_name`, `file_type_for` |
+| `src/remarkpush/reading_list.py` | **Pure** parser for an Obsidian checklist (`- [ ]/[x] [[name.pdf]]`) + case-insensitive wikilink→file resolution | `parse_checklist`, `build_papers_index`, `resolve_wikilink`, `ChecklistEntry` |
+| `src/remarkpush/metadata.py` | Sidecar JSON builders for a *fresh* import (current OS format) | `now_ms`, `document_metadata`, `folder_metadata`, `document_content`, `folder_content` |
 | `src/remarkpush/index.py` | Local sync index (`.remarkpush/index.json`) for idempotent push | `Index`, `Entry`, `sha256_file` |
 | `src/remarkpush/ignore.py` | `.rmpushignore` (gitwildmatch) matcher | `load_ignore`, `is_ignored` |
 | `src/remarkpush/transport/ssh.py` | paramiko SSH/SFTP; deadlock-safe `run`, key install | `connect`, `run`, `install_public_key`, `check`, `SSHError` |
 | `src/remarkpush/transport/usb.py` | USB web interface (xochitl HTTP) for device-rendered annotated pull | `web_interface_up`, `download_rendered_pdf` |
 | `tests/test_device.py` | Unit tests for the pure model/helpers | — |
+| `tests/test_reading_list.py` | Unit tests for the checklist parser + reading-list planner/stale logic | — |
 
 ## Data flow
 
@@ -48,6 +51,13 @@ push:  expand paths (+.rmpushignore) → sha256 (index) → plan
 pull:  documents_under(folder) → either
          download_original()                 (SFTP, exact bytes)  or
          transport/usb.download_rendered_pdf  (device-rendered flattened PDF)
+
+reading-list:  parse_checklist(md) + build_papers_index(papers_dir)
+       → ensure_folder_path("papers to read"/"papers read")   (skipped on --dry-run)
+       → _build_reading_plan: per entry, find_document_by_name (LIBRARY-WIDE, case-insensitive)
+            none → push;  in target folder → noop;  elsewhere → move (never re-upload)
+       → execute: moves (move_document) → uploads (upload_document) → prunes
+            (--prune: move stale managed-folder docs to TRASH_PARENT) → restart_xochitl once
 ```
 
 Key invariants:

@@ -149,6 +149,27 @@ def find_child(items: dict[str, Item], parent_uuid: str, name: str, *, folders_o
     return None
 
 
+def find_document_by_name(items: dict[str, Item], name: str, *, include_trash: bool = False) -> list[Item]:
+    """Every live DocumentType item whose visible_name matches ``name``
+    (case-insensitive), across the *whole* library — unlike ``find_child`` which
+    is scoped to a single parent.
+
+    Used to dedup a reading-list entry against any copy already on the device so
+    we can *move* it instead of uploading a duplicate. Case-insensitive because
+    the hard requirement is "never duplicate": a device copy differing only in
+    case from the source file's stem must still be found."""
+    target = name.casefold()
+    matches: list[Item] = []
+    for item in items.values():
+        if item.deleted or not item.is_document:
+            continue
+        if item.parent == TRASH_PARENT and not include_trash:
+            continue
+        if item.visible_name.casefold() == target:
+            matches.append(item)
+    return matches
+
+
 def _write_text(sftp: _paramiko.SFTPClient, remote_path: str, text: str) -> None:
     with sftp.open(remote_path, "w") as handle:
         handle.write(text.encode("utf-8"))
@@ -219,6 +240,46 @@ def upload_document(
     # Write metadata last: it's what xochitl scans to discover the document.
     _write_text(sftp, f"{base}.metadata", _md.document_metadata(visible_name, parent_uuid))
     return doc_uuid
+
+
+def move_document(
+    sftp: _paramiko.SFTPClient,
+    xochitl_path: str,
+    item: Item,
+    new_parent_uuid: str,
+) -> None:
+    """Re-parent an existing document by rewriting only its ``.metadata`` (the
+    ``parent`` field, plus a fresh ``lastModified``). Does *not* re-upload the
+    file. Mutates ``item`` so in-memory tree state stays correct.
+
+    Moving to ``TRASH_PARENT`` is exactly how a document is trashed (reversible
+    from the device's Trash), so prune reuses this.
+
+    Touching only ``parent``/``lastModified`` is sufficient on the SSH-only path:
+    xochitl rebuilds its tree from each document's ``parent`` on restart. The
+    cloud-reconcile flags (``metadatamodified``/``synced``/``version``) are
+    deliberately left alone — consistent with this tool's "no cloud" stance.
+
+    The new metadata is written to a ``.part`` temp and renamed into place so an
+    interrupted write can never leave a corrupt sidecar (mirrors
+    ``upload_document``)."""
+    meta_path = posixpath.join(xochitl_path, f"{item.uuid}.metadata")
+    with sftp.open(meta_path, "r") as handle:
+        meta = json.loads(handle.read().decode("utf-8"))
+    meta["parent"] = new_parent_uuid
+    meta["lastModified"] = _md.now_ms()
+
+    tmp = f"{meta_path}.part"
+    _write_text(sftp, tmp, json.dumps(meta, indent=4))
+    try:
+        sftp.posix_rename(tmp, meta_path)
+    except (AttributeError, OSError):
+        try:
+            sftp.remove(meta_path)
+        except OSError:
+            pass
+        sftp.rename(tmp, meta_path)
+    item.parent = new_parent_uuid
 
 
 def sanitize_name(name: str) -> str:

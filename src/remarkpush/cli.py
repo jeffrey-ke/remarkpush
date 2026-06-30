@@ -57,7 +57,7 @@ from .reading_list import ChecklistEntry, build_papers_index, parse_checklist, r
 from .transport import ssh, usb
 
 app = typer.Typer(
-    add_completion=False,
+    add_completion=True,
     no_args_is_help=True,
     help="git-style push/pull of PDFs & EPUBs to a reMarkable 2 over SSH.",
 )
@@ -1232,16 +1232,22 @@ def _resolve_md_and_papers(md_file: Path, papers_dir: Path | None) -> tuple[Path
     return md_file, papers_dir
 
 
-def _build_working_tree(
-    md_file: Path, papers_dir: Path
-) -> tuple[dict[str, history.ManifestEntry], list[str]]:
-    """Derive the git *working tree* from the reading-list md: resolve every
-    wikilink to a local PDF and snapshot its content hash + read-state, keyed by
-    file stem (== device visible_name). Repeated stems are de-duped (first wins,
-    matching the push planners). Returns (tree, unresolved wikilink names)."""
+@dataclass
+class _ResolvedPaper:
+    name: str
+    local_path: Path
+    checked: bool
+
+
+def _resolve_papers(md_file: Path, papers_dir: Path) -> tuple[list[_ResolvedPaper], list[str]]:
+    """Resolve every checklist wikilink to a local PDF — the hash-free half of
+    `_build_working_tree`, shared with shell-completion (which can't afford to
+    sha256 every paper, especially over the iCloud-synced papers dir, on every
+    keypress). Repeated stems are de-duped (first wins, matching the push
+    planners). Returns (resolved papers, unresolved wikilink names)."""
     entries = parse_checklist(md_file.read_text(encoding="utf-8"))
     papers_index = build_papers_index(papers_dir)
-    tree: dict[str, history.ManifestEntry] = {}
+    resolved: list[_ResolvedPaper] = []
     unresolved: list[str] = []
     seen: set[str] = set()
     for e in entries:
@@ -1254,10 +1260,43 @@ def _build_working_tree(
         if key in seen:
             continue
         seen.add(key)
-        tree[name] = history.ManifestEntry(
-            sha256=sha256_file(local), checked=e.checked, local_path=str(local)
+        resolved.append(_ResolvedPaper(name=name, local_path=local, checked=e.checked))
+    return resolved, unresolved
+
+
+def _build_working_tree(
+    md_file: Path, papers_dir: Path
+) -> tuple[dict[str, history.ManifestEntry], list[str]]:
+    """Derive the git *working tree* from the reading-list md: resolve every
+    wikilink to a local PDF and snapshot its content hash + read-state, keyed by
+    file stem (== device visible_name). Returns (tree, unresolved wikilink names)."""
+    resolved, unresolved = _resolve_papers(md_file, papers_dir)
+    tree = {
+        p.name: history.ManifestEntry(
+            sha256=sha256_file(p.local_path), checked=p.checked, local_path=str(p.local_path)
         )
+        for p in resolved
+    }
     return tree, unresolved
+
+
+def _complete_paper_name(ctx: typer.Context, incomplete: str) -> list[str]:
+    """Shell-completion for `git add <TAB>`: real resolved paper stems from the
+    reading list, filtered to those containing the partial word typed so far.
+    `git add` matches on the *full* stem (no substring/fuzzy matching — see
+    `git_add` below), so without this a partial guess like 'mask2former' just
+    fails against the full title 'mask2former masked attention mask
+    transformer...'. Swallows any error so a bad/missing md never breaks Tab."""
+    try:
+        md_file = Path(ctx.params.get("md_file") or _DEFAULT_READING_INDEX).expanduser()
+        papers_dir = ctx.params.get("papers_dir")
+        papers_dir = Path(papers_dir).expanduser() if papers_dir else md_file.parent / "papers and figures"
+        if not md_file.is_file() or not papers_dir.is_dir():
+            return []
+        resolved, _ = _resolve_papers(md_file, papers_dir)
+        return [p.name for p in resolved if incomplete.casefold() in p.name.casefold()]
+    except Exception:
+        return []
 
 
 def _fmt_ts(created_at: str) -> str:
@@ -1270,7 +1309,9 @@ def _fmt_ts(created_at: str) -> str:
 @git_app.command("add")
 def git_add(
     papers: list[str] = typer.Argument(
-        None, help="Paper name(s)/stem(s) to stage (e.g. 'mask rcnn'). Omit and use --all."
+        None,
+        help="Paper name(s)/stem(s) to stage (e.g. 'mask rcnn'). Omit and use --all.",
+        autocompletion=_complete_paper_name,
     ),
     all_: bool = typer.Option(False, "--all", "-A", help="Stage every resolved paper in the reading list."),
     md_file: Path = typer.Option(_DEFAULT_READING_INDEX, "--md", help="Reading-list markdown index."),

@@ -34,6 +34,7 @@ class Item:
     deleted: bool = False
     pinned: bool = False
     last_modified: str = ""
+    version: str = ""  # monotonic xochitl change counter (often "" on this no-cloud path)
 
     @property
     def is_folder(self) -> bool:
@@ -96,6 +97,7 @@ def build_items(metadata: dict[str, dict], content: dict[str, dict]) -> dict[str
             deleted=bool(meta.get("deleted", False)),
             pinned=bool(meta.get("pinned", False)),
             last_modified=str(meta.get("lastModified", "")),
+            version=str(meta.get("version", "")),
         )
     return items
 

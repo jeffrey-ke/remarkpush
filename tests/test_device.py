@@ -13,7 +13,7 @@ SAMPLE = f"""
 {MARKER}aaa.metadata
 {{"visibleName": "Books", "type": "CollectionType", "parent": ""}}
 {MARKER}bbb.metadata
-{{"visibleName": "My Paper", "type": "DocumentType", "parent": "aaa", "lastModified": "1700000000000"}}
+{{"visibleName": "My Paper", "type": "DocumentType", "parent": "aaa", "lastModified": "1700000000000", "version": 7}}
 {MARKER}bbb.content
 {{"fileType": "pdf"}}
 {MARKER}ccc.metadata
@@ -32,6 +32,8 @@ def test_parse_and_build():
     assert items["bbb"].is_document
     assert items["bbb"].file_type == "pdf"
     assert items["bbb"].parent == "aaa"
+    assert items["bbb"].last_modified == "1700000000000"
+    assert items["bbb"].version == "7"  # coerced to str even when JSON has an int
     assert items["ddd"].deleted is True
 
 

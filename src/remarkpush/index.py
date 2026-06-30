@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 from .config import repo_dir
@@ -38,6 +38,14 @@ class Entry:
     parent_uuid: str
     size: int
     pushed_at: str
+    # Device-side change baseline, recorded by `git push`/`git pull`. Compared
+    # against the live device `version`/`lastModified` to detect annotations made
+    # on the tablet. Both default to "" so indexes written before this field
+    # existed load unchanged (see `load`). `version` is often "" on the no-cloud
+    # path (xochitl only populates it lazily), so `lastModified` is the practical
+    # signal — see `history.is_remote_modified`.
+    device_version: str = ""
+    device_last_modified: str = ""
 
 
 class Index:
@@ -51,7 +59,14 @@ class Index:
         if not path.exists():
             return cls(path)
         raw = json.loads(path.read_text(encoding="utf-8"))
-        entries = {k: Entry(**v) for k, v in raw.get("entries", {}).items()}
+        known = {f.name for f in fields(Entry)}
+        # Filter to known fields so an index written by a different version
+        # (missing or extra keys) still loads: missing fall back to the dataclass
+        # defaults, surplus keys are dropped rather than crashing the load.
+        entries = {
+            k: Entry(**{kk: vv for kk, vv in v.items() if kk in known})
+            for k, v in raw.get("entries", {}).items()
+        }
         return cls(path, entries)
 
     def save(self) -> None:
@@ -75,6 +90,8 @@ class Index:
         visible_name: str,
         parent_uuid: str,
         size: int,
+        device_version: str = "",
+        device_last_modified: str = "",
     ) -> None:
         self.entries[self.key(local_path)] = Entry(
             sha256=sha256,
@@ -83,4 +100,6 @@ class Index:
             parent_uuid=parent_uuid,
             size=size,
             pushed_at=str(int(time.time())),
+            device_version=device_version,
+            device_last_modified=device_last_modified,
         )

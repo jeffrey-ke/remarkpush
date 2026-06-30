@@ -10,6 +10,7 @@ import getpass
 import posixpath
 import shlex
 import socket
+import time
 import uuid as _uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,9 +50,10 @@ from .device import (
     sanitize_name,
     upload_document,
 )
+from . import history
 from .ignore import is_ignored, load_ignore
 from .index import Index, sha256_file
-from .reading_list import build_papers_index, parse_checklist, resolve_wikilink
+from .reading_list import ChecklistEntry, build_papers_index, parse_checklist, resolve_wikilink
 from .transport import ssh, usb
 
 app = typer.Typer(
@@ -1201,3 +1203,586 @@ def sync_annotations(
         tail.append(f"{len(skipped)} skipped")
     if tail:
         out.print(f"[dim]({', '.join(tail)}.)[/]")
+
+
+# --------------------------------------------------------------------------- #
+# git — local-history layer (stage / commit / log / show / status / push / pull)
+# --------------------------------------------------------------------------- #
+git_app = typer.Typer(
+    no_args_is_help=True,
+    help=(
+        "Local-history (git-like) layer over the reading-list sync: stage & commit "
+        "papers offline, then push/pull the reMarkable. The md is the source of "
+        "truth; stage/commit/log live in .remarkpush/ and are never written back."
+    ),
+)
+
+
+def _resolve_md_and_papers(md_file: Path, papers_dir: Path | None) -> tuple[Path, Path]:
+    """Validate the reading-list md and its papers directory (default: 'papers
+    and figures' beside the md). Shared by the working-tree-building git commands."""
+    md_file = md_file.expanduser()
+    if not md_file.is_file():
+        err.print(f"[red]Reading-list file not found:[/] {md_file}")
+        raise typer.Exit(1)
+    papers_dir = (papers_dir or md_file.parent / "papers and figures").expanduser()
+    if not papers_dir.is_dir():
+        err.print(f"[red]Papers directory not found:[/] {papers_dir}")
+        raise typer.Exit(1)
+    return md_file, papers_dir
+
+
+def _build_working_tree(
+    md_file: Path, papers_dir: Path
+) -> tuple[dict[str, history.ManifestEntry], list[str]]:
+    """Derive the git *working tree* from the reading-list md: resolve every
+    wikilink to a local PDF and snapshot its content hash + read-state, keyed by
+    file stem (== device visible_name). Repeated stems are de-duped (first wins,
+    matching the push planners). Returns (tree, unresolved wikilink names)."""
+    entries = parse_checklist(md_file.read_text(encoding="utf-8"))
+    papers_index = build_papers_index(papers_dir)
+    tree: dict[str, history.ManifestEntry] = {}
+    unresolved: list[str] = []
+    seen: set[str] = set()
+    for e in entries:
+        local = resolve_wikilink(e.link_name, papers_index)
+        if local is None or file_type_for(local) is None:
+            unresolved.append(e.link_name)
+            continue
+        name = local.stem
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        tree[name] = history.ManifestEntry(
+            sha256=sha256_file(local), checked=e.checked, local_path=str(local)
+        )
+    return tree, unresolved
+
+
+def _fmt_ts(created_at: str) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(created_at)))
+    except (ValueError, OSError):
+        return created_at or "—"
+
+
+@git_app.command("add")
+def git_add(
+    papers: list[str] = typer.Argument(
+        None, help="Paper name(s)/stem(s) to stage (e.g. 'mask rcnn'). Omit and use --all."
+    ),
+    all_: bool = typer.Option(False, "--all", "-A", help="Stage every resolved paper in the reading list."),
+    md_file: Path = typer.Option(_DEFAULT_READING_INDEX, "--md", help="Reading-list markdown index."),
+    papers_dir: Path = typer.Option(
+        None, "--papers-dir", help="Folder of source PDFs (default: 'papers and figures' beside the md)."
+    ),
+) -> None:
+    """Stage papers from the reading list for the next commit. Purely local — no
+    device contact. Snapshots each paper's content hash and read-state (so a later
+    md edit isn't committed unless re-added), and never writes back to the md."""
+    if not (papers or all_):
+        err.print("[red]Nothing to stage.[/] Pass paper name(s) or [bold]--all[/].")
+        raise typer.Exit(1)
+    md_file, papers_dir = _resolve_md_and_papers(md_file, papers_dir)
+    tree, unresolved = _build_working_tree(md_file, papers_dir)
+
+    if all_:
+        selected = list(tree)
+    else:
+        by_fold = {n.casefold(): n for n in tree}
+        selected = []
+        for want in papers:
+            key = Path(want).stem.casefold()
+            hit = by_fold.get(key) or by_fold.get(want.casefold())
+            if hit is None:
+                err.print(f"[red]Not in the reading list (or its wikilink is unresolved):[/] {want}")
+                raise typer.Exit(1)
+            selected.append(hit)
+
+    staged = history.load_stage()
+    for name in selected:
+        staged[name] = tree[name]
+    history.save_stage(None, staged)
+
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("staged")
+    table.add_column("read", justify="center")
+    for name in selected:
+        table.add_row(f"[green]{name}[/]", "✓" if tree[name].checked else "")
+    out.print(table)
+    out.print(f"[green]✓ Staged {len(selected)} paper(s).[/] [dim]{len(staged)} staged for the next commit.[/]")
+    if unresolved:
+        out.print(f"[yellow]⚠ {len(unresolved)} wikilink(s) matched no PDF and were skipped.[/]")
+
+
+@git_app.command("commit")
+def git_commit(
+    message: str = typer.Option(..., "-m", "--message", help="Commit message."),
+) -> None:
+    """Snapshot the staged papers into a new local commit. Purely local — no
+    device contact. Overlays the stage onto HEAD's manifest so HEAD always
+    describes the complete desired device state."""
+    staged = history.load_stage()
+    if not staged:
+        out.print("[dim]Nothing staged — run 'remarkpush git add' first.[/]")
+        raise typer.Exit(0)
+    parent = history.read_head()
+    head = history.head_commit()
+    head_manifest = head.manifest if head else {}
+    new_manifest = history.merge_stage_into_head(head_manifest, staged)
+    commit = history.make_commit(parent, new_manifest, message, now=time.time())
+    history.append_commit(None, commit)
+    history.write_head(None, commit.id)
+    history.clear_stage()
+    out.print(
+        f"[green]✓[/] [bold]{commit.id}[/] {message}  "
+        f"[dim]· {len(staged)} staged, {len(new_manifest)} paper(s) total[/]"
+    )
+
+
+@git_app.command("log")
+def git_log(
+    n: int = typer.Option(20, "-n", help="Show at most N commits (0 = all)."),
+) -> None:
+    """Show the local commit history (newest first). Purely local."""
+    log = history.load_log()
+    if not log:
+        out.print("[dim]No commits yet.[/]")
+        raise typer.Exit(0)
+    head = history.read_head()
+    shown = list(reversed(log if n <= 0 else log[-n:]))
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("commit")
+    table.add_column("when")
+    table.add_column("papers", justify="right")
+    table.add_column("message")
+    for c in shown:
+        marker = " [green]← HEAD[/]" if c.id == head else ""
+        table.add_row(f"[bold]{c.id}[/]", _fmt_ts(c.created_at), str(len(c.manifest)), c.message + marker)
+    out.print(table)
+    if n > 0 and len(log) > n:
+        out.print(f"[dim]… {len(log) - n} earlier commit(s) not shown (use -n 0 for all).[/]")
+
+
+@git_app.command("show")
+def git_show(
+    commit: str = typer.Argument("HEAD", help="Commit id / id-prefix, or HEAD."),
+) -> None:
+    """Show a commit's manifest (the papers + read-state it snapshots). Purely local."""
+    ref = history.read_head() if commit.upper() == "HEAD" else commit
+    if not ref:
+        out.print("[dim]No commits yet.[/]")
+        raise typer.Exit(0)
+    c = history.find_commit(None, ref)
+    if c is None:
+        err.print(f"[red]Unknown or ambiguous commit:[/] {commit}")
+        raise typer.Exit(1)
+    out.print(
+        f"[bold]commit {c.id}[/]  [dim]parent {c.parent or '—'} · {_fmt_ts(c.created_at)}[/]"
+    )
+    out.print(f"  {c.message}\n")
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("read", justify="center")
+    table.add_column("document")
+    table.add_column("sha")
+    table.add_column("source")
+    for name, e in sorted(c.manifest.items(), key=lambda kv: kv[0].casefold()):
+        table.add_row("✓" if e.checked else "", name, e.sha256[:10], f"[dim]{e.local_path}[/]")
+    out.print(table)
+    out.print(f"\n[dim]{len(c.manifest)} paper(s).[/]")
+
+
+_GIT_STATUS_STYLE = {
+    "untracked": "green",
+    "staged": "green",
+    "staged-stale": "yellow",
+    "locally-modified": "cyan",
+    "remote-modified": "magenta",
+    "not-on-device": "yellow",
+    "gone-from-md": "yellow",
+    "tracked": "dim",
+    "up-to-date": "dim",
+}
+
+
+@git_app.command("status")
+def git_status(
+    md_file: Path = typer.Option(_DEFAULT_READING_INDEX, "--md", help="Reading-list markdown index."),
+    papers_dir: Path = typer.Option(
+        None, "--papers-dir", help="Folder of source PDFs (default: 'papers and figures' beside the md)."
+    ),
+    offline: bool = typer.Option(False, "--offline", help="Skip the device read; show local columns only."),
+) -> None:
+    """Show working-tree vs HEAD vs stage, plus device annotations.
+
+    Columns: A=staged, M=locally-modified (PDF changed since HEAD), R=remote-
+    modified (annotated on the tablet since the last push/pull). With --offline
+    (or if the device is unreachable) the device columns show '?'."""
+    md_file, papers_dir = _resolve_md_and_papers(md_file, papers_dir)
+    tree, unresolved = _build_working_tree(md_file, papers_dir)
+    head = history.head_commit()
+    head_manifest = head.manifest if head else {}
+    staged = history.load_stage()
+    rows = history.diff_working_tree(tree, head_manifest, staged)
+    index = Index.load()
+
+    items: dict[str, Item] = {}
+    device_known = False
+    if not offline:
+        cfg = _require_config()
+        password = None
+        if not cfg.uses_key:
+            password = getpass.getpass(f"Password for {cfg.target()}: ")
+        try:
+            with out.status("[dim]Reading device library…[/]", spinner="dots"):
+                client = ssh.connect(cfg, password=password)
+                items = read_device(client, cfg.xochitl_path)
+                client.close()
+            device_known = True
+        except ssh.SSHError as exc:
+            err.print(
+                f"[yellow]Device unreachable[/] ({exc}); showing local status only "
+                f"(pass --offline to silence)."
+            )
+
+    if not rows:
+        out.print("[dim]Reading list is empty (no resolvable papers).[/]")
+        raise typer.Exit(0)
+
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("state")
+    table.add_column("A", justify="center")
+    table.add_column("M", justify="center")
+    table.add_column("R", justify="center")
+    table.add_column("dev", justify="center")
+    table.add_column("paper")
+    n_remote = 0
+    for row in rows:
+        # device-derived columns
+        local_path = None
+        for src in (tree, staged, head_manifest):
+            if row.name in src:
+                local_path = src[row.name].local_path
+                break
+        on_device: bool | None = None  # None = device not read (offline/unreachable)
+        remote_mod = False
+        if device_known:
+            matches = find_document_by_name(items, row.name)
+            on_device = bool(matches)
+            if matches and local_path is not None:
+                remote_mod = history.is_remote_modified(matches[0], index.get(Path(local_path)))
+        if remote_mod:
+            n_remote += 1
+
+        state = history.headline(row, on_device=on_device, remote_mod=remote_mod)
+        style = _GIT_STATUS_STYLE.get(state, "")
+        a = "[green]A[/]" if row.staged else "[dim]·[/]"
+        m = "[cyan]M[/]" if row.local_mod else "[dim]·[/]"
+        if not device_known:
+            r = "[dim]?[/]"
+            dev = "[dim]?[/]"
+        else:
+            r = "[magenta]R[/]" if remote_mod else "[dim]·[/]"
+            dev = "on" if on_device else "[red]✗[/]"
+        table.add_row(f"[{style}]{state}[/]", a, m, r, dev, row.name)
+    out.print(table)
+
+    if head is None and not staged:
+        out.print("[dim]No commits yet — 'git add' then 'git commit' to start tracking.[/]")
+    if n_remote:
+        out.print(f"[magenta]✎ {n_remote} paper(s) annotated on the tablet — 'remarkpush git pull' to fetch.[/]")
+    if unresolved:
+        out.print(f"[yellow]⚠ {len(unresolved)} wikilink(s) matched no PDF (not shown).[/]")
+
+
+@git_app.command("push")
+def git_push(
+    to_read_folder: str = typer.Option("papers to read", "--to-read-folder", help="Device folder for unread papers."),
+    read_folder: str = typer.Option("papers read", "--read-folder", help="Device folder for read papers."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the plan; write nothing."),
+    no_restart: bool = typer.Option(False, "--no-restart", help="Don't restart xochitl afterward."),
+) -> None:
+    """Push HEAD's manifest to the reMarkable (reading-list mechanics), then record
+    the device change baseline so later annotations register as remote-modified.
+
+    Unread papers go to 'papers to read', read papers to 'papers read'; a copy
+    already on the device is moved, never duplicated. Removals are out of scope —
+    use 'remarkpush reading-list --prune' to trash dropped papers."""
+    cfg = _require_config()
+    head = history.head_commit()
+    if head is None:
+        out.print("[dim]No commits to push — 'remarkpush git commit' first.[/]")
+        raise typer.Exit(0)
+    manifest = head.manifest
+
+    resolved: list[tuple[str, bool, Path]] = []
+    missing: list[str] = []
+    for name, e in manifest.items():
+        local = Path(e.local_path)
+        if local.is_file():
+            resolved.append((name, e.checked, local))
+        else:
+            missing.append(name)
+    if missing:
+        out.print(f"[yellow]⚠ {len(missing)} committed paper(s) no longer on disk — skipped.[/]")
+
+    # Reuse the reading-list planner by reconstructing its (entries, papers_index) inputs
+    # from the committed manifest (each entry already resolves to a real local file).
+    papers_index = {local.name.casefold(): local for _n, _c, local in resolved}
+    entries = [ChecklistEntry(checked, local.name) for _n, checked, local in resolved]
+
+    password = None
+    if not cfg.uses_key:
+        password = getpass.getpass(f"Password for {cfg.target()}: ")
+    try:
+        with out.status(f"[dim]Connecting to {cfg.target()}…[/]", spinner="dots"):
+            client = ssh.connect(cfg, password=password)
+    except ssh.SSHError as exc:
+        err.print(f"[red]Could not connect:[/] {exc}")
+        _connection_hint(cfg)
+        raise typer.Exit(1)
+
+    n_base = 0
+    try:
+        with out.status("[dim]Reading device library…[/]", spinner="dots"):
+            items = read_device(client, cfg.xochitl_path)
+
+        sftp = client.open_sftp()
+        try:
+            if dry_run:
+                tr = _resolve_folder_uuid(items, to_read_folder)
+                rd = _resolve_folder_uuid(items, read_folder)
+                to_read_uuid = tr if tr is not None else "\x00to-read"
+                read_uuid = rd if rd is not None else "\x00read"
+            else:
+                to_read_uuid = ensure_folder_path(sftp, cfg.xochitl_path, items, to_read_folder)
+                read_uuid = ensure_folder_path(sftp, cfg.xochitl_path, items, read_folder)
+
+            plan = _build_reading_plan(
+                entries, papers_index, items,
+                to_read_uuid=to_read_uuid, read_uuid=read_uuid,
+                to_read_label=to_read_folder, read_label=read_folder,
+            )
+            _print_reading_plan(plan, [], False)
+
+            moves = [p for p in plan if p.action == "move"]
+            uploads = [p for p in plan if p.action == "push"]
+
+            if dry_run:
+                out.print(
+                    f"\n[dim]Dry run — {len(uploads)} upload, {len(moves)} move; nothing written.[/]"
+                )
+                raise typer.Exit(0)
+
+            for p in moves:
+                try:
+                    move_document(sftp, cfg.xochitl_path, items[p.uuid], p.target_uuid)
+                except Exception as exc:  # noqa: BLE001
+                    err.print(f"[red]Move failed:[/] {p.name} — {exc}")
+
+            if uploads:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    DownloadColumn(),
+                    console=out,
+                ) as prog:
+                    for p in uploads:
+                        task = prog.add_task(p.name[:38], total=p.size)
+
+                        def _cb(done: int, total: int, _t=task, _sz=p.size) -> None:
+                            prog.update(_t, completed=done, total=total or _sz)
+
+                        upload_document(
+                            sftp, cfg.xochitl_path, p.local,
+                            parent_uuid=p.target_uuid, visible_name=p.name,
+                            file_type=file_type_for(p.local) or "pdf", progress=_cb,
+                        )
+                        prog.update(task, completed=p.size)
+        finally:
+            sftp.close()
+
+        if not no_restart:
+            with out.status("[dim]Restarting xochitl…[/]", spinner="dots"):
+                restart_xochitl(client)
+
+        # Baseline: re-read the (post-write, post-restart) device and record each
+        # committed paper's uuid + version + lastModified into the index. This
+        # seeds change detection and — by capturing the timestamp our own move/
+        # upload just wrote — keeps those writes from later reading as remote-mod.
+        with out.status("[dim]Recording device baseline…[/]", spinner="dots"):
+            fresh = read_device(client, cfg.xochitl_path)
+        index = Index.load()
+        for name, e in manifest.items():
+            matches = find_document_by_name(fresh, name)
+            if not matches:
+                continue
+            m = matches[0]
+            local = Path(e.local_path)
+            size = local.stat().st_size if local.is_file() else 0
+            index.record(
+                local, sha256=e.sha256, uuid=m.uuid, visible_name=name,
+                parent_uuid=m.parent, size=size,
+                device_version=m.version, device_last_modified=m.last_modified,
+            )
+            n_base += 1
+        index.save()
+    finally:
+        client.close()
+
+    out.print(
+        f"\n[green]✓ {len(uploads)} uploaded, {len(moves)} moved.[/] "
+        f"[dim]baseline recorded for {n_base} paper(s).[/]"
+    )
+    if no_restart:
+        out.print("[dim]Skipped xochitl restart — changes appear after the next restart/reboot.[/]")
+
+
+@git_app.command("pull")
+def git_pull(
+    suffix: str = typer.Option(
+        "_annotated", "--suffix", help="Inserted before .pdf so the pull doesn't clobber the original."
+    ),
+    out_dir: Path = typer.Option(
+        None, "-o", "--out", help="Write pulled PDFs here instead of beside each source file."
+    ),
+    all_: bool = typer.Option(
+        False, "--all", help="Pull every on-device paper, not just those changed since the last sync."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the plan; download nothing."),
+) -> None:
+    """Pull annotated (device-rendered) PDFs for HEAD's papers that changed on the
+    tablet since the last push/pull, writing '<name>_annotated.pdf' beside each
+    source. Read-only on the device; does NOT create a commit. Use --all to pull
+    every on-device paper regardless of the change baseline."""
+    cfg = _require_config()
+    head = history.head_commit()
+    if head is None:
+        out.print("[dim]No commits — nothing to pull for. 'remarkpush git commit' first.[/]")
+        raise typer.Exit(0)
+    manifest = head.manifest
+    out_dir = out_dir.expanduser() if out_dir is not None else None
+
+    papers_index: dict[str, Path] = {}
+    entries: list[ChecklistEntry] = []
+    for _name, e in manifest.items():
+        local = Path(e.local_path)
+        papers_index[local.name.casefold()] = local
+        entries.append(ChecklistEntry(e.checked, local.name))
+
+    password = None
+    if not cfg.uses_key:
+        password = getpass.getpass(f"Password for {cfg.target()}: ")
+    try:
+        with out.status(f"[dim]Connecting to {cfg.target()}…[/]", spinner="dots"):
+            client = ssh.connect(cfg, password=password)
+            items = read_device(client, cfg.xochitl_path)
+    except ssh.SSHError as exc:
+        err.print(f"[red]Could not connect:[/] {exc}")
+        _connection_hint(cfg)
+        raise typer.Exit(1)
+
+    index = Index.load()
+    plan = _build_annotation_plan(
+        entries, papers_index, items,
+        checked_only=False, suffix=suffix, out_dir=out_dir, skip_existing=False,
+    )
+
+    # Gate the on-device 'pull' items by the change baseline (unless --all): only
+    # fetch a render when the device version/lastModified moved past what we recorded.
+    changed: list[_AnnotationItem] = []
+    unchanged: list[_AnnotationItem] = []
+    for p in plan:
+        if p.action != "pull":
+            continue
+        item = items.get(p.uuid)
+        if all_ or (item is not None and history.is_remote_modified(item, index.get(p.local))):
+            changed.append(p)
+        else:
+            unchanged.append(p)
+    missing = [p for p in plan if p.action == "not-on-device"]
+    unresolved = [p for p in plan if p.action == "unresolved"]
+
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("action")
+    table.add_column("document")
+    table.add_column("→ local path")
+    for p in changed:
+        table.add_row("[green]pull[/]", p.name, str(p.dest))
+    for p in unchanged:
+        table.add_row("[dim]unchanged[/]", f"[dim]{p.name}[/]", f"[dim]{p.dest}[/]")
+    for p in missing:
+        table.add_row("[yellow]not on device[/]", p.name, "[dim]— nothing to render[/]")
+    for p in unresolved:
+        table.add_row("[red]unresolved[/]", f"[red]{p.link_name}[/]", "[dim]— no matching PDF[/]")
+    out.print(table)
+
+    if dry_run:
+        client.close()
+        out.print(f"\n[dim]Dry run — {len(changed)} would download, nothing written.[/]")
+        raise typer.Exit(0)
+    if not changed:
+        client.close()
+        out.print("\n[dim]Nothing to pull — no device-side changes since the last sync.[/]")
+        raise typer.Exit(0)
+
+    web_host = cfg.host
+    if not usb.web_interface_up(web_host):
+        client.close()
+        err.print(
+            f"[red]Annotated pull needs the device renderer, but the USB web interface "
+            f"isn't reachable at {web_host}:80.[/]"
+        )
+        err.print("[dim]Enable it on the tablet: Settings → Storage → USB web interface, "
+                  "then make sure you're connected over the USB cable.[/]")
+        raise typer.Exit(1)
+
+    n_ok = 0
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            console=out,
+        ) as prog:
+            task = prog.add_task("pulling", total=len(changed))
+            for p in changed:
+                prog.update(task, description=p.name[:38])
+                p.dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    usb.download_rendered_pdf(p.uuid, p.dest, host=web_host)
+                    n_ok += 1
+                    # Advance this paper's baseline to the just-observed device state
+                    # so it isn't re-pulled until the next annotation.
+                    item = items[p.uuid]
+                    prev = index.get(p.local)
+                    index.record(
+                        p.local,
+                        sha256=prev.sha256 if prev else (sha256_file(p.local) if p.local.is_file() else ""),
+                        uuid=p.uuid, visible_name=p.name, parent_uuid=item.parent,
+                        size=prev.size if prev else (p.local.stat().st_size if p.local.is_file() else 0),
+                        device_version=item.version, device_last_modified=item.last_modified,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    err.print(f"[red]Failed:[/] {p.name} — {exc}")
+                prog.advance(task)
+        index.save()
+    finally:
+        client.close()
+
+    out.print(f"\n[green]✓ Pulled {n_ok}/{len(changed)} annotated PDF(s).[/]")
+    tail = []
+    if unchanged and not all_:
+        tail.append(f"{len(unchanged)} unchanged")
+    if missing:
+        tail.append(f"{len(missing)} not on device")
+    if unresolved:
+        tail.append(f"{len(unresolved)} unresolved")
+    if tail:
+        out.print(f"[dim]({', '.join(tail)}.)[/]")
+
+
+app.add_typer(git_app, name="git")

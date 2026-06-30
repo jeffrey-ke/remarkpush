@@ -988,3 +988,216 @@ def pull(
     out.print(f"\n[green]✓ Pulled {n_ok}/{len(downloads)} document(s) to {out_dir}/[/]")
     if skipped:
         out.print(f"[dim]Skipped {len(skipped)} notebook(s) (no original; use --annotated to render them).[/]")
+
+
+# --------------------------------------------------------------------------- #
+# sync-annotations
+# --------------------------------------------------------------------------- #
+@dataclass
+class _AnnotationItem:
+    link_name: str
+    checked: bool
+    local: Path | None       # resolved source PDF, None when the link didn't match
+    name: str                # device visible_name == local.stem ("" if unresolved)
+    uuid: str                # device doc uuid (for pull), "" when not on device
+    dest: Path | None        # where the annotated copy is written, None when skipped early
+    action: str              # pull | skip-unchecked | not-on-device | skip-existing | unresolved
+
+
+def _build_annotation_plan(
+    entries,
+    papers_index: dict[str, Path],
+    items: dict[str, Item],
+    *,
+    checked_only: bool,
+    suffix: str,
+    out_dir: Path | None,
+    skip_existing: bool,
+) -> list[_AnnotationItem]:
+    """Per-entry pull plan: resolve the wikilink to a local source, find a live
+    device copy by name (library-wide, case-insensitive), and target the
+    annotated render at ``<source><suffix>.pdf`` beside the original (or under
+    ``out_dir``). Repeated stems are de-duped (first occurrence wins)."""
+    plan: list[_AnnotationItem] = []
+    seen: set[str] = set()
+    for e in entries:
+        local = resolve_wikilink(e.link_name, papers_index)
+        if local is None or file_type_for(local) is None:
+            plan.append(_AnnotationItem(e.link_name, e.checked, None, "", "", None, "unresolved"))
+            continue
+        name = local.stem
+        key = name.casefold()
+        if key in seen:  # same paper listed twice in the md — first occurrence wins
+            continue
+        seen.add(key)
+
+        if checked_only and not e.checked:
+            plan.append(_AnnotationItem(e.link_name, e.checked, local, name, "", None, "skip-unchecked"))
+            continue
+
+        matches = find_document_by_name(items, name)
+        if not matches:
+            plan.append(_AnnotationItem(e.link_name, e.checked, local, name, "", None, "not-on-device"))
+            continue
+
+        dest = (out_dir or local.parent) / f"{local.stem}{suffix}.pdf"
+        action = "skip-existing" if (skip_existing and dest.exists()) else "pull"
+        plan.append(_AnnotationItem(e.link_name, e.checked, local, name, matches[0].uuid, dest, action))
+    return plan
+
+
+_ANNOTATION_STYLE = {
+    "pull": ("[green]pull[/]", None),
+    "skip-unchecked": ("[dim]skip (unread)[/]", "dim"),
+    "not-on-device": ("[yellow]not on device[/]", "yellow"),
+    "skip-existing": ("[dim]skip (exists)[/]", "dim"),
+    "unresolved": ("[red]unresolved[/]", "red"),
+}
+
+
+def _print_annotation_plan(plan: list[_AnnotationItem]) -> None:
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("action")
+    table.add_column("document")
+    table.add_column("→ local path")
+    for p in plan:
+        label, _style = _ANNOTATION_STYLE[p.action]
+        if p.action == "unresolved":
+            table.add_row(label, f"[red]{p.link_name}[/]", "[dim]— no matching PDF[/]")
+        elif p.action == "not-on-device":
+            table.add_row(label, p.name, "[dim]— nothing to render[/]")
+        elif p.action == "pull":
+            table.add_row(label, p.name, str(p.dest))
+        else:  # skip-unchecked / skip-existing
+            table.add_row(label, f"[dim]{p.name}[/]", f"[dim]{p.dest}[/]" if p.dest else "")
+    out.print(table)
+
+
+@app.command(name="sync-annotations")
+def sync_annotations(
+    md_file: Path = typer.Argument(
+        _DEFAULT_READING_INDEX, help="Obsidian checklist markdown file (the reading-list index)."
+    ),
+    papers_dir: Path = typer.Option(
+        None, "--papers-dir", help="Folder of source PDFs (default: 'papers and figures' beside the md file)."
+    ),
+    checked_only: bool = typer.Option(
+        False, "--checked-only", help="Only pull papers checked (read) in the md."
+    ),
+    suffix: str = typer.Option(
+        "_annotated", "--suffix", help="Inserted before .pdf so the pull doesn't clobber the original."
+    ),
+    out_dir: Path = typer.Option(
+        None, "-o", "--out", help="Write pulled PDFs here instead of beside each source file."
+    ),
+    skip_existing: bool = typer.Option(
+        False, "--skip-existing", help="Skip papers whose annotated copy already exists."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the plan; download nothing."),
+) -> None:
+    """Pull annotated (device-rendered) PDFs for a reading-list checklist.
+
+    For each wikilink in the markdown index, the matching document's flattened
+    annotated PDF is fetched from the tablet (over the USB web interface) and
+    written beside the original source as '<name>_annotated.pdf', so your
+    annotations land in the vault without clobbering the pristine original. By
+    default every listed paper that exists on the device is pulled; use
+    --checked-only to restrict to papers marked read."""
+    cfg = _require_config()
+
+    md_file = md_file.expanduser()
+    if not md_file.is_file():
+        err.print(f"[red]Reading-list file not found:[/] {md_file}")
+        raise typer.Exit(1)
+    papers_dir = (papers_dir or md_file.parent / "papers and figures").expanduser()
+    if not papers_dir.is_dir():
+        err.print(f"[red]Papers directory not found:[/] {papers_dir}")
+        raise typer.Exit(1)
+    out_dir = out_dir.expanduser() if out_dir is not None else None
+
+    entries = parse_checklist(md_file.read_text(encoding="utf-8"))
+    if not entries:
+        out.print("[dim]No checklist entries found in the markdown file.[/]")
+        raise typer.Exit(0)
+    papers_index = build_papers_index(papers_dir)
+
+    password = None
+    if not cfg.uses_key:
+        password = getpass.getpass(f"Password for {cfg.target()}: ")
+    try:
+        with out.status(f"[dim]Connecting to {cfg.target()}…[/]", spinner="dots"):
+            client = ssh.connect(cfg, password=password)
+            items = read_device(client, cfg.xochitl_path)
+    except ssh.SSHError as exc:
+        err.print(f"[red]Could not connect:[/] {exc}")
+        _connection_hint(cfg)
+        raise typer.Exit(1)
+
+    plan = _build_annotation_plan(
+        entries, papers_index, items,
+        checked_only=checked_only, suffix=suffix, out_dir=out_dir, skip_existing=skip_existing,
+    )
+    _print_annotation_plan(plan)
+
+    pulls = [p for p in plan if p.action == "pull"]
+    missing = [p for p in plan if p.action == "not-on-device"]
+    unresolved = [p for p in plan if p.action == "unresolved"]
+    skipped = [p for p in plan if p.action in ("skip-unchecked", "skip-existing")]
+
+    if unresolved:
+        out.print(f"\n[yellow]⚠ {len(unresolved)} wikilink(s) matched no PDF in {papers_dir.name}/[/]")
+    if missing:
+        out.print(f"[yellow]⚠ {len(missing)} paper(s) not on the device — nothing to render.[/]")
+
+    if dry_run:
+        client.close()
+        out.print(f"\n[dim]Dry run — {len(pulls)} would download, nothing written.[/]")
+        raise typer.Exit(0)
+    if not pulls:
+        client.close()
+        out.print("\n[dim]Nothing to pull.[/]")
+        raise typer.Exit(0)
+
+    web_host = cfg.host
+    if not usb.web_interface_up(web_host):
+        client.close()
+        err.print(
+            f"[red]Annotated pull needs the device renderer, but the USB web interface "
+            f"isn't reachable at {web_host}:80.[/]"
+        )
+        err.print("[dim]Enable it on the tablet: Settings → Storage → USB web interface, "
+                  "then make sure you're connected over the USB cable.[/]")
+        raise typer.Exit(1)
+
+    n_ok = 0
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            console=out,
+        ) as prog:
+            task = prog.add_task("pulling", total=len(pulls))
+            for p in pulls:
+                prog.update(task, description=p.name[:38])
+                p.dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    usb.download_rendered_pdf(p.uuid, p.dest, host=web_host)
+                    n_ok += 1
+                except Exception as exc:  # noqa: BLE001
+                    err.print(f"[red]Failed:[/] {p.name} — {exc}")
+                prog.advance(task)
+    finally:
+        client.close()
+
+    out.print(f"\n[green]✓ Pulled {n_ok}/{len(pulls)} annotated PDF(s).[/]")
+    tail = []
+    if missing:
+        tail.append(f"{len(missing)} not on device")
+    if unresolved:
+        tail.append(f"{len(unresolved)} unresolved")
+    if skipped:
+        tail.append(f"{len(skipped)} skipped")
+    if tail:
+        out.print(f"[dim]({', '.join(tail)}.)[/]")

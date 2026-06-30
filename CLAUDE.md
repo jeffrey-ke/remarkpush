@@ -15,14 +15,15 @@ uv run remarkpush init        # configure device, install SSH key, verify
 uv run remarkpush preflight   # check device is ready (after plugging in)
 uv run remarkpush push paper.pdf --to Reading
 uv run remarkpush pull Reading -o ./out --annotated
-uv run remarkpush reading-list notes.md --dry-run   # sync an Obsidian checklist
+uv run remarkpush reading-list notes.md --dry-run        # push an Obsidian checklist → device
+uv run remarkpush sync-annotations notes.md --dry-run    # pull annotated PDFs back beside the sources
 ```
 
 ## Module index
 
 | Module | Role | Key exports |
 |---|---|---|
-| `src/remarkpush/cli.py` | Typer CLI; all commands + plan/progress/render helpers | `app`, `init`, `preflight`, `ls`, `push`, `status`, `pull`, `reading_list` |
+| `src/remarkpush/cli.py` | Typer CLI; all commands + plan/progress/render helpers | `app`, `init`, `preflight`, `ls`, `push`, `status`, `pull`, `reading_list`, `sync_annotations` |
 | `src/remarkpush/config.py` | Per-machine device config (`~/.config/remarkpush/config.toml`) + repo paths | `DeviceConfig`, `load_config`, `save_config`, `repo_dir` |
 | `src/remarkpush/device.py` | xochitl store model (read tree) + writer (push/move) + pull helpers | `Item`, `read_device`, `parse_dump`, `build_items`, `children_map`, `ensure_folder_path`, `upload_document`, `move_document`, `restart_xochitl`, `documents_under`, `download_original`, `folder_path_of`, `find_child`, `find_document_by_name`, `sanitize_name`, `file_type_for` |
 | `src/remarkpush/reading_list.py` | **Pure** parser for an Obsidian checklist (`- [ ]/[x] [[name.pdf]]`) + case-insensitive wikilink→file resolution | `parse_checklist`, `build_papers_index`, `resolve_wikilink`, `ChecklistEntry` |
@@ -33,6 +34,7 @@ uv run remarkpush reading-list notes.md --dry-run   # sync an Obsidian checklist
 | `src/remarkpush/transport/usb.py` | USB web interface (xochitl HTTP) for device-rendered annotated pull | `web_interface_up`, `download_rendered_pdf` |
 | `tests/test_device.py` | Unit tests for the pure model/helpers | — |
 | `tests/test_reading_list.py` | Unit tests for the checklist parser + reading-list planner/stale logic | — |
+| `tests/test_sync_annotations.py` | Unit tests for the sync-annotations planner (pull/not-on-device/unresolved/skip/dedup) | — |
 
 ## Data flow
 
@@ -58,6 +60,14 @@ reading-list:  parse_checklist(md) + build_papers_index(papers_dir)
             none → push;  in target folder → noop;  elsewhere → move (never re-upload)
        → execute: moves (move_document) → uploads (upload_document) → prunes
             (--prune: move stale managed-folder docs to TRASH_PARENT) → restart_xochitl once
+
+sync-annotations:  parse_checklist(md) + build_papers_index(papers_dir)   (inverse of reading-list)
+       → _build_annotation_plan: per entry resolve_wikilink → local Path; find_document_by_name
+            (LIBRARY-WIDE) → device UUID; target <stem>_annotated.pdf beside the source (or -o dir)
+            none on device → not-on-device;  --checked-only → skip unread;  --skip-existing → skip
+       → read_device over SSH only maps name→UUID; bytes come over the USB web interface
+            (usb.web_interface_up gate → usb.download_rendered_pdf, HTTP /download/{uuid}/pdf)
+       → READ-ONLY on device: no SFTP, no Index writes, no restart_xochitl
 ```
 
 Key invariants:
